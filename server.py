@@ -50,6 +50,7 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
+from yuric_oauth import auth_kwargs, register_login
 
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
@@ -106,11 +107,27 @@ import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
+# Public endpoint: cap stateful sessions + reap idle ones (mcp>=1.30) so stray
+# clients can't pile up memory; OAuth on when OAUTH_PASSWORD is set (yuric_oauth).
 mcp = FastMCP(
     "Ombre Brain",
     host="0.0.0.0",
     port=OMBRE_PORT,
+    max_sessions=50,
+    session_idle_timeout=900,
+    **auth_kwargs("cache", "https://cache.yuric-wen.com"),
 )
+register_login(mcp)
+
+
+def _hook_authorized(request) -> bool:
+    """Hooks return memory content — require Den's static bearer once OAuth is on."""
+    if not os.environ.get("OAUTH_PASSWORD"):
+        return True
+    expected = os.environ.get("MCP_TOKEN", "")
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    return bool(expected) and hmac.compare_digest(token, expected)
 
 
 # =============================================================
@@ -323,6 +340,8 @@ async def health_check(request):
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
+    if not _hook_authorized(request):
+        return PlainTextResponse("unauthorized", status_code=401)
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         # pinned
@@ -380,6 +399,8 @@ async def breath_hook(request):
 @mcp.custom_route("/dream-hook", methods=["GET"])
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
+    if not _hook_authorized(request):
+        return PlainTextResponse("unauthorized", status_code=401)
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
